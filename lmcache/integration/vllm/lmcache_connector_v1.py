@@ -28,8 +28,25 @@ logger = init_logger(__name__)
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config=vllm_config, role=role)
+    # NOTE: vLLM's KV connector API evolved to include kv_cache_config.
+    # Accept it to stay compatible across vLLM versions.
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: Optional[Any] = None,
+        **kwargs: Any,
+    ):
+        try:
+            super().__init__(
+                vllm_config=vllm_config,
+                role=role,
+                kv_cache_config=kv_cache_config,
+                **kwargs,
+            )
+        except TypeError:
+            # Older vLLM versions.
+            super().__init__(vllm_config=vllm_config, role=role)
         self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
 
     # ==============================

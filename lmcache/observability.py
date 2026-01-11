@@ -1352,10 +1352,12 @@ class PrometheusLogger:
         # assert PrometheusLogger._instance.metadata == metadata, \
         #    "PrometheusLogger instance already created with different metadata"
         if PrometheusLogger._instance.metadata != metadata:
-            logger.error(
-                "PrometheusLogger instance already created with"
-                "different metadata. This should not happen except "
-                "in test"
+            # This can happen in single-process test/integration setups where the
+            # scheduler and worker are instantiated in the same process.
+            # Reuse the existing singleton to avoid noisy errors.
+            logger.debug(
+                "PrometheusLogger already created with different metadata; "
+                "reusing existing instance (new metadata ignored)."
             )
         return PrometheusLogger._instance
 

@@ -492,14 +492,42 @@ class LMCacheConnectorV1Impl:
             vllm_config.kv_transfer_config.kv_connector_extra_config
         )
         if kv_connector_extra_config:
+            # Some LMCache integration-specific settings live under
+            # LMCacheEngineConfig.extra_config to avoid bloating the public config
+            # surface area.
+            extra_config_keys = {
+                "tiered_local_cpu_enabled",
+                "tiered_local_cpu_cxl_numa_node",
+                "tiered_local_cpu_prefetch_workers",
+            }
             for key, value in kv_connector_extra_config.items():
                 if key.startswith("lmcache."):
                     config_key = key[8:]  # Remove "lmcache." prefix
-                    if validate_and_set_config_value(config, config_key, value):
+
+                    # Route integration-only keys into extra_config.
+                    if config_key in extra_config_keys:
+                        extra = dict(config.extra_config or {})
+                        extra[config_key] = value
+                        config.extra_config = extra
                         logger.info(
-                            "Updated config %s from vLLM extra config: %s",
+                            "Updated config.extra_config[%s] from vLLM extra config: %s",
                             config_key,
                             value,
+                        )
+                        continue
+
+                    # Otherwise, apply to the strongly-typed config if it exists.
+                    if hasattr(config, config_key):
+                        if validate_and_set_config_value(config, config_key, value):
+                            logger.info(
+                                "Updated config %s from vLLM extra config: %s",
+                                config_key,
+                                value,
+                            )
+                    else:
+                        logger.warning(
+                            "Unknown LMCache config key from vLLM extra config: %s",
+                            config_key,
                         )
 
     def _init_connector_state(
