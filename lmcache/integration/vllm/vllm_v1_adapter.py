@@ -270,6 +270,9 @@ class ReqMeta:
     # Whether is last prefill or not
     is_last_prefill: bool = False
 
+    # Whether the request is in decode phase (metadata only; not part of cache key)
+    is_decode_phase: bool = False
+
     # Skip save or not
     save_spec: Optional[SaveSpec] = None
     # load_spec
@@ -308,6 +311,8 @@ class ReqMeta:
         is_last_prefill = False
         if input_token_len >= tracker.prompt_len:
             is_last_prefill = True
+
+        is_decode_phase = bool(tracker.is_decode_phase)
 
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
@@ -409,6 +414,7 @@ class ReqMeta:
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             is_last_prefill=is_last_prefill,
+            is_decode_phase=is_decode_phase,
             save_spec=save_spec,
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
@@ -516,6 +522,9 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+
+            # Worker-side phase tracking to detect prefill->decode transitions.
+            self._req_phase_decode: dict[str, bool] = {}
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -1090,6 +1099,14 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         for request in connector_metadata.requests:
+            # Worker-side decode transition detection.
+            prev_decode = self._req_phase_decode.get(request.req_id, False)
+            cur_decode = bool(getattr(request, "is_decode_phase", False))
+            if not prev_decode and cur_decode and self.lmcache_engine is not None:
+                # Best-effort async promotion of already-stored prompt KV.
+                self.lmcache_engine.tiered_promote_req_async(request.req_id)
+            self._req_phase_decode[request.req_id] = cur_decode
+
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
 
@@ -1159,6 +1176,7 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
+                allocation_hint=("decode" if request.is_decode_phase else "prefill"),
             )
 
             # Update skip_leading_tokens only on last rank to ensure
@@ -1598,6 +1616,12 @@ class LMCacheConnectorV1Impl:
             return_params = {
                 "first_tok": request._output_token_ids[0],
             }
+
+        # Best-effort cleanup for tiered promotion tracking.
+        if self.lmcache_engine is not None:
+            self.lmcache_engine.tiered_forget_req(request.request_id)
+        if hasattr(self, "_req_phase_decode"):
+            self._req_phase_decode.pop(request.request_id, None)
 
         return False, return_params
 

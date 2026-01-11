@@ -322,6 +322,7 @@ class StorageManager:
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
         busy_loop=True,
+        allocation_hint: Optional[str] = None,
     ) -> Optional[MemoryObj]:
         """
         Allocate memory object with memory allocator.
@@ -331,7 +332,12 @@ class StorageManager:
         # disk in a similar way as CPU.
         assert self.allocator_backend is not None
         return self.allocator_backend.allocate(
-            shapes, dtypes, fmt, eviction=eviction, busy_loop=busy_loop
+            shapes,
+            dtypes,
+            fmt,
+            eviction=eviction,
+            busy_loop=busy_loop,
+            allocation_hint=allocation_hint,
         )
 
     @_lmcache_nvtx_annotate
@@ -343,6 +349,7 @@ class StorageManager:
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
         busy_loop=True,
+        allocation_hint: Optional[str] = None,
     ) -> Optional[list[MemoryObj]]:
         """
         Batched allocate memory object with memory allocator.
@@ -353,7 +360,13 @@ class StorageManager:
         if self.allocator_backend is None:
             raise RuntimeError("Allocator backend not available for scheduler role")
         return self.allocator_backend.batched_allocate(
-            shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
+            shapes,
+            dtypes,
+            batch_size,
+            fmt,
+            eviction=eviction,
+            busy_loop=busy_loop,
+            allocation_hint=allocation_hint,
         )
 
     def put(

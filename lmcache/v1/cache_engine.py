@@ -216,6 +216,14 @@ class LMCacheEngine:
         if not config.py_enable_gc:
             gc.disable()
 
+        # Track which cache keys were produced by which request.
+        # Used for tiered host-memory promotion (e.g., CXL -> DRAM) without
+        # affecting cache-key composition.
+        self._req_to_keys: dict[str, set[CacheEngineKey]] = defaultdict(set)
+        self._req_key_tracking_cap: int = int(
+            (config.extra_config or {}).get("tiered_req_key_tracking_cap", 2048)
+        )
+
     def post_init(self, **kwargs) -> None:
         if not self.post_inited:
             logger.info("Post initializing LMCacheEngine")
@@ -364,6 +372,12 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        allocation_hint = kwargs.get("allocation_hint", None)
+
+        req_id = kwargs.get("req_id")
+        if req_id is not None:
+            assert isinstance(req_id, str)
+
         prev_key = 0
         for start, end, key in self.token_database.process_tokens(
             tokens,
@@ -384,6 +398,7 @@ class LMCacheEngine:
                 kv_dtypes,
                 busy_loop=self.force_store_wait,
                 fmt=self.fmt,
+                allocation_hint=allocation_hint,
             )
             if memory_obj is None:
                 logger.warning(
@@ -398,6 +413,9 @@ class LMCacheEngine:
             ends.append(end)
             keys.append(key)
             memory_objs.append(memory_obj)
+
+            if req_id is not None and len(self._req_to_keys[req_id]) < self._req_key_tracking_cap:
+                self._req_to_keys[req_id].add(key)
             tot_kv_size += memory_obj.get_size()
             tot_token_num += num_tokens
 
@@ -526,6 +544,12 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        allocation_hint = kwargs.get("allocation_hint", None)
+
+        req_id = kwargs.get("req_id")
+        if req_id is not None:
+            assert isinstance(req_id, str)
+
         prev_key = 0
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
@@ -547,6 +571,7 @@ class LMCacheEngine:
                 batch_size=self.num_layers,
                 fmt=self.fmt,
                 busy_loop=self.force_store_wait,
+                allocation_hint=allocation_hint,
             )
 
             if memory_objs_multi_layer is None:
@@ -560,6 +585,10 @@ class LMCacheEngine:
             ends.append(end)
             keys.append(keys_multi_layer)
             memory_objs.append(memory_objs_multi_layer)
+
+            if req_id is not None and len(self._req_to_keys[req_id]) < self._req_key_tracking_cap:
+                # Track the un-layered key (layer keys are derived deterministically).
+                self._req_to_keys[req_id].add(key)
             tot_token_num += num_tokens
 
             # Create KV event
@@ -1152,6 +1181,25 @@ class LMCacheEngine:
             logger.error(
                 f"Error during cleanup_memory_objs for lookup_id={lookup_id}: {e}"
             )
+
+    def tiered_promote_req_async(self, req_id: str) -> None:
+        """Best-effort async promotion of this request's host KV from slow tier to fast tier.
+
+        No-op unless the allocator backend (typically LocalCPUBackend) implements
+        `promote_keys_async(keys, ...)`.
+        """
+        if self.storage_manager is None:
+            return
+        keys = list(self._req_to_keys.get(req_id, set()))
+        if not keys:
+            return
+        backend = self.storage_manager.storage_backends.get("LocalCPUBackend")
+        promote = getattr(backend, "promote_keys_async", None)
+        if callable(promote):
+            promote(keys)
+
+    def tiered_forget_req(self, req_id: str) -> None:
+        self._req_to_keys.pop(req_id, None)
 
     # TODO(Jiayi): Need to handle the case where `tokens=None`.
     # In this case, we compress all tokens.

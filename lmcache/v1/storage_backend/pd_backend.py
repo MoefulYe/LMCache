@@ -244,6 +244,7 @@ class PDBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_hint: Optional[str] = None,
     ) -> Optional[MemoryObj]:
         if fmt is None:
             fmt = MemoryFormat.KV_2LTD
@@ -262,6 +263,7 @@ class PDBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_hint: Optional[str] = None,
     ):
         if fmt is None:
             fmt = MemoryFormat.KV_2LTD

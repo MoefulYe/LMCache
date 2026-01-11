@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Union
 import threading
 import time
@@ -28,6 +28,7 @@ from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterfac
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.v1.system_detection import NUMADetector, SystemMemoryDetector
+from lmcache.v1.system_detection import NUMAMapping
 
 if TYPE_CHECKING:
     # First Party
@@ -69,6 +70,44 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if memory_allocator is None
             else memory_allocator
         )
+
+        # Optional tiered host allocation: DRAM (fast) + CXL/NUMA (slow).
+        # This is intentionally controlled via extra_config to keep it minimally invasive.
+        extra = config.extra_config or {}
+        self._tiered_enabled: bool = bool(extra.get("tiered_local_cpu_enabled", False))
+        self._tiered_cxl_numa_node: Optional[int] = (
+            int(extra["tiered_local_cpu_cxl_numa_node"])
+            if "tiered_local_cpu_cxl_numa_node" in extra
+            else None
+        )
+        self._tiered_prefetch_workers: int = int(
+            extra.get("tiered_local_cpu_prefetch_workers", 2)
+        )
+
+        self._dram_allocator: Optional[MemoryAllocatorInterface] = None
+        self._cxl_allocator: Optional[MemoryAllocatorInterface] = None
+        self._key_tier: dict[CacheEngineKey, str] = {}
+        self._promote_pool: Optional[ThreadPoolExecutor] = None
+
+        if self._tiered_enabled:
+            if self._tiered_cxl_numa_node is None:
+                raise ValueError(
+                    "tiered_local_cpu_enabled requires extra_config['tiered_local_cpu_cxl_numa_node']"
+                )
+
+            # DRAM allocator uses the default NUMA mapping (existing behavior).
+            self._dram_allocator = self.memory_allocator
+
+            # CXL allocator uses a fixed NUMA node for all GPUs.
+            fixed_mapping = self._make_fixed_numa_mapping(self._tiered_cxl_numa_node)
+            self._cxl_allocator = self._initialize_allocator_with_mapping(
+                config, metadata, fixed_mapping
+            )
+
+            self._promote_pool = ThreadPoolExecutor(
+                max_workers=self._tiered_prefetch_workers,
+                thread_name_prefix="lmcache-tiered-promote",
+            )
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
@@ -116,6 +155,56 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def __str__(self):
         return self.__class__.__name__
 
+    def _make_fixed_numa_mapping(self, node: int) -> NUMAMapping:
+        if torch.cuda.is_available():
+            n = torch.cuda.device_count()
+        else:
+            n = 1
+        return NUMAMapping({i: node for i in range(n)})
+
+    def _initialize_allocator_with_mapping(
+        self,
+        config: LMCacheEngineConfig,
+        metadata: Optional[LMCacheEngineMetadata],
+        numa_mapping: NUMAMapping,
+    ) -> MemoryAllocatorInterface:
+        """Create a CPU allocator with an explicit NUMA mapping.
+
+        This mirrors initialize_allocator() but forces the mapping.
+        """
+        cpu_size = config.max_local_cpu_size
+
+        if metadata is not None:
+            save_only_first_rank = (
+                config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
+                and metadata.use_mla
+            )
+            if save_only_first_rank and metadata.is_first_rank():
+                cpu_size = config.get_extra_config_value(
+                    "first_rank_max_local_cpu_size", cpu_size
+                )
+
+        cpu_size = self._calculate_effective_cpu_size(cpu_size, config, metadata)
+
+        use_lazy = (
+            config.enable_lazy_memory_allocator
+            and cpu_size > config.lazy_memory_safe_size
+        )
+        if use_lazy:
+            return LazyMixedMemoryAllocator(
+                int(cpu_size * 1024**3),
+                config=config,
+                numa_mapping=numa_mapping,
+                memory_limit_callback=lambda: int(
+                    self._calculate_effective_cpu_size(cpu_size, config, metadata)
+                    * 1024**3
+                ),
+            )
+        return MixedMemoryAllocator(
+            int(cpu_size * 1024**3),
+            numa_mapping=numa_mapping,
+        )
+
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.cpu_lock:
             if key not in self.hot_cache:
@@ -152,6 +241,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
+
+            if self._tiered_enabled:
+                tier = getattr(memory_obj, "_lmcache_tier", None)
+                self._key_tier[key] = tier if tier in ("dram", "cxl") else "dram"
 
             self.cache_policy.update_on_put(key)
 
@@ -252,6 +345,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return False
 
         memory_obj = self.hot_cache.pop(key)
+        if self._tiered_enabled:
+            self._key_tier.pop(key, None)
         memory_obj.ref_count_down()
 
         if force:
@@ -423,6 +518,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_hint: Optional[str] = None,
     ) -> Optional[MemoryObj]:
         """
         Allocate a memory object of shape and dtype
@@ -454,7 +550,21 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+        allocator = self.memory_allocator
+        if self._tiered_enabled and self._dram_allocator is not None and self._cxl_allocator is not None:
+            hint = (allocation_hint or "dram").lower()
+            if hint in ("prefill", "cxl", "slow"):
+                allocator = self._cxl_allocator
+            else:
+                allocator = self._dram_allocator
+
+        memory_obj = allocator.allocate(shapes, dtypes, fmt)
+        if memory_obj is not None and self._tiered_enabled:
+            setattr(
+                memory_obj,
+                "_lmcache_tier",
+                "cxl" if allocator is self._cxl_allocator else "dram",
+            )
         if memory_obj is not None or not eviction:
             return memory_obj
 
@@ -505,7 +615,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+            memory_obj = allocator.allocate(shapes, dtypes, fmt)
             if memory_obj is not None:
                 break
 
@@ -527,6 +637,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_hint: Optional[str] = None,
     ) -> Optional[List[MemoryObj]]:
         """
         Batched allocate `batch_size` memory objects of shape and dtype
@@ -559,9 +670,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_objs = self.memory_allocator.batched_allocate(
-            shapes, dtypes, batch_size, fmt
-        )
+        allocator = self.memory_allocator
+        if self._tiered_enabled and self._dram_allocator is not None and self._cxl_allocator is not None:
+            hint = (allocation_hint or "dram").lower()
+            if hint in ("prefill", "cxl", "slow"):
+                allocator = self._cxl_allocator
+            else:
+                allocator = self._dram_allocator
+
+        memory_objs = allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
+        if memory_objs is not None and self._tiered_enabled:
+            tier = "cxl" if allocator is self._cxl_allocator else "dram"
+            for m in memory_objs:
+                setattr(m, "_lmcache_tier", tier)
 
         if memory_objs is not None or not eviction:
             return memory_objs
@@ -642,6 +763,60 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_objs
+
+    def promote_keys_async(self, keys: Sequence[CacheEngineKey]) -> None:
+        """Asynchronously promote cached chunks from CXL tier to DRAM tier.
+
+        Safety policy (MVP): only promotes objects that are exclusively held
+        by this backend (ref_count==1) and not pinned (pin_count==0).
+        """
+        if not self._tiered_enabled or self._promote_pool is None:
+            return
+        if self._dram_allocator is None or self._cxl_allocator is None:
+            return
+
+        for key in keys:
+            self._promote_pool.submit(self._promote_one_key, key)
+
+    def _promote_one_key(self, key: CacheEngineKey) -> None:
+        try:
+            with self.cpu_lock:
+                if self._key_tier.get(key) != "cxl":
+                    return
+                mem_obj = self.hot_cache.get(key)
+                if mem_obj is None or mem_obj.tensor is None:
+                    return
+                # Only safe if nobody else is holding it.
+                if mem_obj.meta.pin_count != 0 or mem_obj.meta.ref_count != 1:
+                    return
+                shape = mem_obj.get_shape()
+                dtype = mem_obj.get_dtype()
+                fmt = mem_obj.meta.fmt
+
+            # Allocate in DRAM outside the backend lock.
+            new_obj = self._dram_allocator.allocate(shape, dtype, fmt)
+            if new_obj is None or new_obj.tensor is None:
+                return
+
+            # CPU-to-CPU copy; keep it simple for MVP.
+            new_obj.tensor.copy_(mem_obj.tensor)
+
+            with self.cpu_lock:
+                # Re-check ownership and mapping stability.
+                cur = self.hot_cache.get(key)
+                if cur is not mem_obj:
+                    # Drop the newly allocated object.
+                    new_obj.ref_count_down()
+                    return
+
+                new_obj.ref_count_up()
+                self.hot_cache[key] = new_obj
+                self._key_tier[key] = "dram"
+
+                # Release backend's reference to the old object.
+                mem_obj.ref_count_down()
+        except Exception:
+            logger.exception("Failed to promote key %s", key)
 
     def get_full_chunk_size(self) -> int:
         logger.info("Calculating the size of a single LMCache chunk")
@@ -737,4 +912,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.memory_allocator.close()
+        if self._cxl_allocator is not None and self._cxl_allocator is not self.memory_allocator:
+            try:
+                self._cxl_allocator.close()
+            except Exception:
+                logger.exception("Failed to close CXL allocator")
+        if self._promote_pool is not None:
+            self._promote_pool.shutdown(wait=False)
         self.clear()
